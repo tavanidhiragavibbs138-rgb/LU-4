@@ -17,6 +17,8 @@ function App(){
   const [gmailEmail,setGmailEmail] = useState('');
   const [gmailBusy,setGmailBusy] = useState(false);
   const [gmailMessage,setGmailMessage] = useState('');
+  const [gmailFallback,setGmailFallback] = useState(null);
+  const [pendingMail,setPendingMail] = useState(null);
   const fileRef = useRef();
 
   const activeSheet = sheets.find(s=>s.id===activeId) || null;
@@ -72,26 +74,64 @@ function App(){
     setShowLogin(true);
   }
 
-  function connectGmail(){
+  function connectGmail(draftToSend=null){
+    if(draftToSend) setPendingMail(draftToSend);
+    setGmailBusy(true);
+    setGmailMessage('Connecting to Gmail...');
     if(!window.google?.accounts?.oauth2){
       setGmailMessage('Google sign-in library is still loading. Refresh and try again.');
+      setGmailBusy(false);
       return;
     }
-    const tokenClient = window.google.accounts.oauth2.initTokenClient({
-      client_id:GOOGLE_CLIENT_ID,
-      scope:GOOGLE_GMAIL_SCOPE,
-      callback:async response=>{
-        if(response.error){ setGmailMessage(response.error); return; }
-        setGmailToken(response.access_token);
-        try{
-          const result = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/profile', {headers:{Authorization:`Bearer ${response.access_token}`}});
-          const profile = await result.json();
-          setGmailEmail(profile.emailAddress || 'Gmail connected');
-          setGmailMessage('Gmail connected');
-        }catch(e){ setGmailEmail('Gmail connected'); }
-      },
-    });
-    tokenClient.requestAccessToken({prompt:gmailToken ? '' : 'consent'});
+    try{
+      let callbackReceived = false;
+      const tokenClient = window.google.accounts.oauth2.initTokenClient({
+        client_id:GOOGLE_CLIENT_ID,
+        scope:GOOGLE_GMAIL_SCOPE,
+        callback:async response=>{
+          callbackReceived = true;
+          if(response.error){
+            const message = response.error === 'access_denied'
+              ? 'Google blocked this app. Add your Gmail account as a test user in Google Cloud OAuth consent screen, then try again.'
+              : (response.error_description || response.error);
+            setGmailMessage(message);
+            setGmailBusy(false);
+            return;
+          }
+          try{
+            const result = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/profile', {headers:{Authorization:`Bearer ${response.access_token}`}});
+            const profile = await result.json();
+            if(!result.ok) throw new Error(profile.error?.message || `Gmail profile request failed (${result.status}).`);
+            setGmailToken(response.access_token);
+            setGmailEmail(profile.emailAddress || 'Gmail connected');
+            setGmailMessage('Gmail connected');
+            if(draftToSend){
+              const sent = await launchMail(draftToSend, response.access_token);
+              if(sent){
+                setPendingMail(null);
+                setCompose(null);
+              }
+            }
+          }catch(e){
+            setGmailToken(null);
+            setGmailEmail('');
+            setGmailMessage(e.message || 'Gmail connection failed.');
+          }finally{
+            setGmailBusy(false);
+          }
+        },
+      });
+      tokenClient.requestAccessToken({prompt:'consent', include_granted_scopes:false});
+      window.setTimeout(()=>{
+        if(!callbackReceived){
+          setGmailBusy(false);
+          setGmailMessage('Google sign-in did not open. Allow pop-ups for localhost:8000 and verify this URL is an authorized JavaScript origin in Google Cloud.');
+        }
+      }, 15000);
+    }catch(e){
+      setGmailMessage(e.message || 'Could not open Google sign-in.');
+      setGmailBusy(false);
+    }
   }
 
   function parseSheetFromWorkbook(json){
@@ -186,8 +226,6 @@ function App(){
   }
 
   // ---- Email reminder helpers ----
-  // No backend/email service is wired up here, so "sending" opens the person's own
-  // email client (via mailto:) pre-filled, or copies the address list to paste into one.
   function personalMailto(r){
     const subject = `Reminder: finish "${r.lu || 'your LU'}"`;
     const pctLine = `You're currently at ${r.pct}% completion.`;
@@ -210,6 +248,10 @@ function App(){
     return {recipients, subject, body};
   }
 
+  function gmailComposeUrl(draft){
+    return `https://mail.google.com/mail/?view=cm&fs=1&to=${encodeURIComponent(draft.recipients.join(','))}&su=${encodeURIComponent(draft.subject)}&body=${encodeURIComponent(draft.body)}`;
+  }
+
   function openMailMenu(targetRows){
     if(targetRows.length===0) return;
     setMailMenu(targetRows);
@@ -226,7 +268,7 @@ function App(){
     launchMail(draft);
   }
 
-  async function sendThroughGmail(draft){
+  async function sendThroughGmail(draft, accessToken=gmailToken){
     const lines = [
       `Bcc: ${draft.recipients.join(', ')}`,
       `Subject: ${draft.subject}`,
@@ -238,31 +280,40 @@ function App(){
       .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
     const result = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
       method:'POST',
-      headers:{Authorization:`Bearer ${gmailToken}`,'Content-Type':'application/json'},
+      headers:{Authorization:`Bearer ${accessToken}`,'Content-Type':'application/json'},
       body:JSON.stringify({raw:encoded}),
     });
-    if(!result.ok) throw new Error('Gmail could not send this message. Reconnect Gmail and try again.');
+    if(!result.ok){
+      const details = await result.json().catch(()=>({}));
+      const message = details.error?.message || `Gmail send failed (${result.status}).`;
+      if(result.status===401 || message.toLowerCase().includes('insufficient authentication scopes')){
+        setGmailToken(null);
+        setGmailEmail('');
+        throw new Error('Google issued a token without Gmail send access. Close any old Google permission window, reload the app, and click Connect Gmail again. Approve Send email on your behalf.');
+      }
+      throw new Error(message);
+    }
   }
 
-  async function launchMail(draft){
-    if(draft.recipients.length===0) return;
-    if(gmailToken){
-      setGmailBusy(true); setGmailMessage('Sending email...');
-      try{
-        await sendThroughGmail(draft);
-        setGmailMessage(`Sent from ${gmailEmail || 'Gmail'}`);
-      }catch(error){
-        setGmailMessage(error.message);
-      }finally{ setGmailBusy(false); }
-      return;
+  async function launchMail(draft, accessToken=gmailToken){
+    if(draft.recipients.length===0) return false;
+    if(!accessToken){
+      setGmailMessage('Connect Gmail before sending a reminder.');
+      return false;
     }
-    const mailto = `mailto:?bcc=${encodeURIComponent(draft.recipients.join(','))}&subject=${encodeURIComponent(draft.subject)}&body=${encodeURIComponent(draft.body)}`;
-    if(mailto.length>1800){
-      copyEmails();
-      alert('There are too many recipients for one mailto link. The email list was copied to your clipboard.');
-      return;
-    }
-    window.location.href = mailto;
+    setGmailBusy(true); setGmailMessage('Sending email...');
+    try{
+      await sendThroughGmail(draft, accessToken);
+      setGmailFallback(null);
+      setGmailMessage(`Sent from ${gmailEmail || 'Gmail'}`);
+      return true;
+    }catch(error){
+      setGmailMessage(error.message);
+      if(error.message.toLowerCase().includes('authentication scopes')){
+        setGmailFallback(gmailComposeUrl(draft));
+      }
+      return false;
+    }finally{ setGmailBusy(false); }
   }
 
   const incomplete = useMemo(()=> rows.filter(r=> statusOf(r.pct,r.date,dateType)!=='complete' && r.gmail),[rows,dateType]);
@@ -356,20 +407,25 @@ function App(){
             <button className="modal-close" onClick={()=>setMailMenu(null)}>×</button>
             <h2>Send reminder</h2>
             <p>{mailTarget.length===1 ? `To ${mailTarget[0].name || mailTarget[0].gmail}` : `To ${mailTarget.length} incomplete assignments`}</p>
-            <button className="mail-choice" onClick={()=>openComposer(mailTarget)}><b>Send with a note</b><span>Edit the message before opening your email app.</span></button>
-            <button className="mail-choice" onClick={()=>openTemplateMail(mailTarget)}><b>Send without a note</b><span>Use the saved reminder template.</span></button>
+            <button className="mail-choice" onClick={()=>openComposer(mailTarget)}><b>Send with a note</b><span>Edit the message before sending through Gmail.</span></button>
+            <button className="mail-choice" onClick={()=>openTemplateMail(mailTarget)}><b>Send without a note</b><span>Send the saved reminder template through Gmail.</span></button>
           </div>
         </div>
       )}
       {compose && (
         <div className="mail-menu-overlay" onClick={()=>setCompose(null)}>
-          <form className="mail-compose" onClick={e=>e.stopPropagation()} onSubmit={e=>{e.preventDefault(); launchMail(compose); setCompose(null);}}>
+          <form className="mail-compose" onClick={e=>e.stopPropagation()} onSubmit={async e=>{
+            e.preventDefault();
+            if(!gmailToken){ connectGmail(compose); return; }
+            if(await launchMail(compose)) setCompose(null);
+          }}>
             <button type="button" className="modal-close" onClick={()=>setCompose(null)}>×</button>
             <h2>Edit email</h2>
             <label>Recipients</label><input value={compose.recipients.join(', ')} readOnly />
             <label>Subject</label><input value={compose.subject} onChange={e=>setCompose({...compose,subject:e.target.value})} />
             <label>Message</label><textarea rows="9" value={compose.body} onChange={e=>setCompose({...compose,body:e.target.value})} />
-            <button className="login-submit" type="submit">Open email app</button>
+            <button className="login-submit" type="submit" disabled={gmailBusy}>{gmailBusy ? 'Sending...' : (gmailToken ? 'Send email' : 'Connect Gmail to send')}</button>
+            <a className="signin-btn" href={gmailComposeUrl(compose)} target="_blank" rel="noreferrer">Open prefilled Gmail draft</a>
           </form>
         </div>
       )}
@@ -377,9 +433,10 @@ function App(){
         {gmailToken ? (
           <span className="gmail-status">{gmailEmail || 'Gmail connected'}</span>
         ) : (
-          <button className="signin-btn" onClick={connectGmail}>Connect Gmail</button>
+          <button className="signin-btn" onClick={connectGmail} disabled={gmailBusy}>{gmailBusy ? 'Connecting...' : 'Connect Gmail'}</button>
         )}
         {gmailMessage && <span className="gmail-message">{gmailMessage}</span>}
+        {gmailFallback && <a className="signin-btn" href={gmailFallback} target="_blank" rel="noreferrer">Open Gmail draft</a>}
         {authUser ? (
           <>
             <span className="account-id">{authUser.email}</span>
