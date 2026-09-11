@@ -8,6 +8,9 @@ function App(){
   const [pctFilter,setPctFilter] = useState('all');
   const [pctExact,setPctExact] = useState('');
   const [view,setView] = useState('assignments');
+  const [selectedSubject,setSelectedSubject] = useState('all');
+  const [showSubjects,setShowSubjects] = useState(false);
+  const [subjectSearch,setSubjectSearch] = useState('');
   const [copyMsg,setCopyMsg] = useState('');
   const [authUser,setAuthUser] = useState(null);
   const [showLogin,setShowLogin] = useState(true);
@@ -28,6 +31,15 @@ function App(){
 
   const STATUS_META = dateType==='due' ? STATUS_META_DUE : STATUS_META_ACTIVITY;
   const dateColLabel = dateType==='due' ? 'End Date' : (dateType==='activity' ? 'Last Active' : '—');
+
+  const subjectNames = useMemo(()=>{
+    return Array.from(new Set(rows.map(r=>r.lu || 'Unlabelled'))).sort((a,b)=>a.localeCompare(b, undefined, {sensitivity:'base'}));
+  },[rows]);
+  const activeSubject = subjectNames.includes(selectedSubject) ? selectedSubject : 'all';
+  const subjectRows = useMemo(()=>{
+    if(activeSubject==='all') return rows;
+    return rows.filter(r=>(r.lu || 'Unlabelled')===activeSubject);
+  },[rows,activeSubject]);
 
   useEffect(()=>{
     try{
@@ -211,6 +223,9 @@ function App(){
       const newActive = newSheets[0].id;
       setSheets(combined);
       setActiveId(newActive);
+      setSelectedSubject('all');
+      setSubjectSearch('');
+      setShowSubjects(false);
       persist(combined, newActive);
     }
     e.target.value = '';
@@ -316,7 +331,7 @@ function App(){
     }finally{ setGmailBusy(false); }
   }
 
-  const incomplete = useMemo(()=> rows.filter(r=> statusOf(r.pct,r.date,dateType)!=='complete' && r.gmail),[rows,dateType]);
+  const incomplete = useMemo(()=> subjectRows.filter(r=> statusOf(r.pct,r.date,dateType)!=='complete' && r.gmail),[subjectRows,dateType]);
 
   async function copyEmails(){
     const emails = Array.from(new Set(incomplete.map(r=>r.gmail)));
@@ -331,13 +346,13 @@ function App(){
   }
 
   const squads = useMemo(()=>{
-    const s = new Set(rows.map(r=>r.squad).filter(Boolean));
+    const s = new Set(subjectRows.map(r=>r.squad).filter(Boolean));
     return Array.from(s).sort();
-  },[rows]);
+  },[subjectRows]);
 
   const filtered = useMemo(()=>{
     const threshold = pctExact==='' ? null : Math.max(0, Math.min(100, Number(pctExact)));
-    return rows.filter(r=>{
+    return subjectRows.filter(r=>{
       const st = statusOf(r.pct, r.date, dateType);
       if(statusFilter!=='all' && st!==statusFilter) return false;
       if(squadFilter!=='all' && r.squad!==squadFilter) return false;
@@ -348,16 +363,16 @@ function App(){
       }
       return true;
     }).sort((a,b)=> b.pct - a.pct || a.name.localeCompare(b.name, undefined, {sensitivity:'base'}));
-  },[rows,search,statusFilter,squadFilter,pctExact,dateType]);
+  },[subjectRows,search,statusFilter,squadFilter,pctExact,dateType]);
 
   const stats = useMemo(()=>{
-    const total = rows.length;
-    const people = new Set(rows.map(r=>r.gmail||r.name)).size;
-    const avg = total ? Math.round(rows.reduce((a,r)=>a+r.pct,0)/total) : 0;
+    const total = subjectRows.length;
+    const people = new Set(subjectRows.map(r=>r.gmail||r.name)).size;
+    const avg = total ? Math.round(subjectRows.reduce((a,r)=>a+r.pct,0)/total) : 0;
     const counts = {complete:0, ontrack:0, due:0, overdue:0, notstarted:0};
-    rows.forEach(r=> counts[statusOf(r.pct,r.date,dateType)]++ );
+    subjectRows.forEach(r=> counts[statusOf(r.pct,r.date,dateType)]++ );
     return {total, people, avg, counts};
-  },[rows,dateType]);
+  },[subjectRows,dateType]);
 
   const byPerson = useMemo(()=>{
     const map = {};
@@ -451,7 +466,6 @@ function App(){
       <div className="hero">
         <div>
           <h1>LU Completion Tracker</h1>
-          <p className="sub">Upload one or more roster exports with name, email, LU/subject, completion % and a date column — each file gets its own tab, auto-mapped and tracked separately.</p>
         </div>
         <div className="upload-row">
           <button className="upload-btn" onClick={()=>fileRef.current.click()}>
@@ -472,6 +486,23 @@ function App(){
               <span className="tab-close" onClick={(evt)=>closeSheet(s.id, evt)}>×</span>
             </button>
           ))}
+        </div>
+      )}
+
+      {rows.length>0 && (
+        <div className="subject-picker">
+          <button className="subject-toggle" onClick={()=>setShowSubjects(!showSubjects)} aria-expanded={showSubjects}>
+            {activeSubject==='all' ? 'Subjects: All subjects' : `Subjects: ${activeSubject}`} <span>{showSubjects ? '−' : '+'}</span>
+          </button>
+          {showSubjects && (
+            <div className="subject-menu">
+              <input className="subject-search" type="search" placeholder="Search subjects..." value={subjectSearch} onChange={e=>setSubjectSearch(e.target.value)} autoFocus />
+              <button className={activeSubject==='all'?'active':''} onClick={()=>setSelectedSubject('all')}>All subjects <small>{rows.length}</small></button>
+              {subjectNames.filter(subject=>subject.toLowerCase().includes(subjectSearch.toLowerCase())).map(subject=>(
+                <button key={subject} className={activeSubject===subject?'active':''} onClick={()=>setSelectedSubject(subject)}>{subject} <small>{rows.filter(r=>(r.lu || 'Unlabelled')===subject).length}</small></button>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
